@@ -14,6 +14,29 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Locate Godot project (unpacks an uploaded .zip if needed)
+        run: |
+          P=$(find . -name project.godot -not -path "*/.godot/*" -not -path "./_proj/*" | head -n 1)
+          if [ -z "$P" ]; then
+            Z=$(find . -maxdepth 3 -iname "*.zip" -not -path "./.git/*" | head -n 1)
+            if [ -z "$Z" ]; then
+              echo "::error::No project.godot and no .zip found in the repo. Upload HighwayTV-stage4.zip (or its extracted contents)."
+              ls -R | head -50
+              exit 1
+            fi
+            echo "Unpacking $Z"
+            mkdir -p _proj
+            unzip -q -o "$Z" -d _proj
+            P=$(find _proj -name project.godot -not -path "*/.godot/*" | head -n 1)
+            [ -n "$P" ] || { echo "::error::$Z does not contain project.godot"; exit 1; }
+          fi
+          D=$(dirname "$P")
+          echo "PROJECT_DIR=$D" >> "$GITHUB_ENV"
+          echo "Project directory: $D"
+          for f in export_presets.cfg scripts/main.gd scenes/main.tscn scenes/menu.tscn; do
+            [ -f "$D/$f" ] || { echo "::error::Missing $D/$f - the project is incomplete."; exit 1; }
+          done
+
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -56,19 +79,46 @@ jobs:
           echo "GODOT_ANDROID_KEYSTORE_DEBUG_PASSWORD=android" >> "$GITHUB_ENV"
 
       - name: Install Android gradle build template + Android TV manifest patch
+        working-directory: ${{ env.PROJECT_DIR }}
         run: |
           mkdir -p android/build
           unzip -q ~/.local/share/godot/export_templates/${GODOT_VERSION}.stable/android_source.zip -d android/build
           echo -n "${GODOT_VERSION}.stable" > android/.build_version
           touch android/build/.gdignore
-          python3 tools/patch_android_manifest.py
+          python3 - <<'PY'
+          import pathlib, re, sys
+          p = pathlib.Path("android/build/AndroidManifest.xml")
+          s = p.read_text(encoding="utf-8")
+          if "LEANBACK_LAUNCHER" not in s:
+              s, n = re.subn(
+                  r'(<category\s+android:name="android\.intent\.category\.LAUNCHER"\s*/>)',
+                  r'\1\n                <category android:name="android.intent.category.LEANBACK_LAUNCHER" />',
+                  s, count=1)
+              if n == 0:
+                  sys.exit("ERROR: LAUNCHER category not found in manifest")
+          feats = ""
+          if "android.software.leanback" not in s:
+              feats += '    <uses-feature android:name="android.software.leanback" android:required="false" />\n'
+          if "android.hardware.touchscreen" not in s:
+              feats += '    <uses-feature android:name="android.hardware.touchscreen" android:required="false" />\n'
+          if feats:
+              s = s.replace("<application", feats + "    <application", 1)
+          if "android:banner" not in s:
+              s = s.replace("<application", '<application android:banner="@mipmap/icon"', 1)
+          if "LEANBACK_LAUNCHER" not in s:
+              sys.exit("ERROR: manifest patch failed")
+          p.write_text(s, encoding="utf-8")
+          print("Android TV manifest patch applied")
+          PY
 
       - name: Import project
+        working-directory: ${{ env.PROJECT_DIR }}
         run: |
           godot --headless --path . --import || true
           godot --headless --path . --import || true
 
       - name: Export APK
+        working-directory: ${{ env.PROJECT_DIR }}
         run: |
           mkdir -p build
           godot --headless --path . --export-debug "Android TV" build/HighwayTV-debug.apk
@@ -77,4 +127,4 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: HighwayTV-apk
-          path: build/*.apk
+          path: ${{ env.PROJECT_DIR }}/build/*.apk
